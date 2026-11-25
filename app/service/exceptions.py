@@ -8,3 +8,15 @@ class InvalidUploadError(AudioServiceError):
 
 class AudioProcessingError(AudioServiceError):
     """The file could not be decoded, transcribed or censored."""
+
+
+class UserAlreadyExistsError(Exception):
+    """A user with this email is already registered."""
+
+
+class InvalidCredentialsError(Exception):
+    """The username/email and password do not match a user."""
+
+
+class InvalidTokenError(Exception):
+    """The access token is malformed, expired, badly signed or points to no user."""

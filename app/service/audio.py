@@ -4,6 +4,7 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import UploadFile
+from sqlmodel import desc, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.audio_censor import AudioCensor
@@ -30,6 +31,13 @@ class AudioService:
         """Return the Audio row with the given ID, or None if not found."""
         return await self.session.get(Audio, audio_id)
 
+    async def list_audio(self, limit: int = 50, offset: int = 0) -> list[Audio]:
+        """Return Audio rows, newest first."""
+        result = await self.session.exec(
+            select(Audio).order_by(desc(Audio.created_at)).offset(offset).limit(limit)
+        )
+        return list(result.all())
+
     def _censor_file(self, file_path: str, output_path: str) -> None:
         """Blocking CPU work: transcribe, flag profanity, write the beeped file."""
         words = self.ac.transcribe_audio(file_path)
@@ -39,7 +47,7 @@ class AudioService:
             words=self.ac.profanity_check(words["word_segments"]),
         )
 
-    async def censor_audio(self, audio_file: UploadFile) -> Audio:
+    async def censor_audio(self, audio_file: UploadFile, user_id: UUID) -> Audio:
         """Save the upload, beep out profanity, record it in the DB and return the row."""
         if not audio_file.filename:
             raise InvalidUploadError("The uploaded file has no filename.")
@@ -68,7 +76,11 @@ class AudioService:
             ) from exc
 
         # Only record the row once the censored file actually exists.
-        audio = Audio(filepath=filename, censored_filepath=censored_filename)
+        audio = Audio(
+            filepath=filename,
+            censored_filepath=censored_filename,
+            user_id=user_id,
+        )
         try:
             self.session.add(audio)
             await self.session.commit()

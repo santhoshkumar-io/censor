@@ -59,4 +59,9 @@ async def scalar_docs() -> HTMLResponse:
     return get_scalar_api_reference(
         openapi_url=app.openapi_url,
         title=f"{app.title} - Scalar",
+        # Pre-select the OAuth2 password login in the Auth panel, so "Authorize"
+        # calls /token and attaches the bearer token to every request.
+        authentication={"preferredSecurityScheme": "OAuth2PasswordBearer"},
+        # Keep the token in the browser across reloads (dev docs convenience).
+        persist_auth=True,
     )
