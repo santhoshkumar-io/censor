@@ -15,6 +15,7 @@ from app.service.exceptions import (
     AudioProcessingError,
     InvalidCredentialsError,
     InvalidUploadError,
+    TaskQueueError,
     UserAlreadyExistsError,
 )
 
@@ -49,16 +50,20 @@ async def login_user(
     return Token(access_token=access_token, token_type="bearer")
 
 
-@audio_router.post("/audio", response_model=AudioRead, status_code=status.HTTP_201_CREATED)
+@audio_router.post("/audio", response_model=AudioRead, status_code=status.HTTP_202_ACCEPTED)
 async def submit_audio(
     audio_file: UploadFile, service: AudioServiceDep, user: CurrentUserDep
 ):
+    """Queue an upload for censoring. Poll ``GET /audio/{id}`` until ``status`` is
+    ``completed`` or ``failed``."""
     # FastAPI caches get_current_user per request, so this reuses the
     # router-level check rather than decoding the token twice.
     try:
         return await service.censor_audio(audio_file, user_id=user.id)
     except InvalidUploadError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except TaskQueueError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     except AudioProcessingError as exc:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)

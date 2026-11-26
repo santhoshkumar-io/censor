@@ -20,3 +20,7 @@ class InvalidCredentialsError(Exception):
 
 class InvalidTokenError(Exception):
     """The access token is malformed, expired, badly signed or points to no user."""
+
+
+class TaskQueueError(AudioServiceError):
+    """The audio was saved but the background task could not be queued (broker down)."""

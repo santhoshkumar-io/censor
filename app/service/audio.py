@@ -7,25 +7,21 @@ from fastapi import UploadFile
 from sqlmodel import desc, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.audio_censor import AudioCensor
-from app.database.models import Audio
-from app.service.exceptions import AudioProcessingError, InvalidUploadError
-from app.utils import get_upload_path, save_file
+from app.database.models import Audio, AudioStatus
+from app.service.exceptions import (
+    AudioProcessingError,
+    InvalidUploadError,
+    TaskQueueError,
+)
+from app.utils import save_file
+from app.worker.tasks import censor_audio_task
 
 logger = logging.getLogger(__name__)
-
-# Loads both models once, when this module is first imported.
-# AudioService is built per request, so it reuses this instance instead of
-# reloading the Whisper models every time.
-_audio_censor = AudioCensor()
-# Only one request uses the shared models at a time.
-_audio_censor_lock = asyncio.Lock()
 
 
 class AudioService:
     def __init__(self, session: AsyncSession):
         self.session = session
-        self.ac = _audio_censor
 
     async def get_audio_by_id(self, audio_id: UUID) -> Audio | None:
         """Return the Audio row with the given ID, or None if not found."""
@@ -38,49 +34,25 @@ class AudioService:
         )
         return list(result.all())
 
-    def _censor_file(self, file_path: str, output_path: str) -> None:
-        """Blocking CPU work: transcribe, flag profanity, write the beeped file."""
-        words = self.ac.transcribe_audio(file_path)
-        self.ac.mute_audio(
-            input_path=file_path,
-            output_path=output_path,
-            words=self.ac.profanity_check(words["word_segments"]),
-        )
-
     async def censor_audio(self, audio_file: UploadFile, user_id: UUID) -> Audio:
-        """Save the upload, beep out profanity, record it in the DB and return the row."""
+        """Save the upload, record it as pending and queue the censoring task.
+
+        The Celery worker does the slow model work and updates ``status``
+        (processing -> completed / failed) and ``censored_filepath``.
+        """
         if not audio_file.filename:
             raise InvalidUploadError("The uploaded file has no filename.")
         filename = Path(audio_file.filename).name
         if not filename:
             raise InvalidUploadError("The uploaded file has no usable filename.")
-        censored_filename = f"censored_{filename}"
 
-        # Save the upload first: transcribe_audio reads the file from disk.
+        # Save the upload first: the worker reads the file from disk.
         try:
-            file_path = await asyncio.to_thread(save_file, audio_file)
+            await asyncio.to_thread(save_file, audio_file)
         except OSError as exc:
             raise AudioProcessingError(f"Could not save '{filename}'.") from exc
 
-        output_path = get_upload_path(censored_filename)
-        try:
-            # Run the slow model work in a thread so the event loop stays free.
-            async with _audio_censor_lock:
-                await asyncio.to_thread(self._censor_file, file_path, output_path)
-        except Exception as exc:
-            # ffmpeg/whisperx/pydub raise assorted errors (RuntimeError,
-            # CouldntDecodeError, KeyError...) for files they cannot read.
-            logger.exception("Censoring failed for %s", file_path)
-            raise AudioProcessingError(
-                f"Could not process '{filename}'. Make sure it is a valid audio file."
-            ) from exc
-
-        # Only record the row once the censored file actually exists.
-        audio = Audio(
-            filepath=filename,
-            censored_filepath=censored_filename,
-            user_id=user_id,
-        )
+        audio = Audio(filepath=filename, user_id=user_id, status=AudioStatus.pending)
         try:
             self.session.add(audio)
             await self.session.commit()
@@ -88,4 +60,17 @@ class AudioService:
         except Exception:
             await self.session.rollback()
             raise
+
+        # Queue only after the commit, so the worker can find the row.
+        try:
+            # .delay() talks to the broker over the network; keep it off the event loop.
+            await asyncio.to_thread(censor_audio_task.delay, str(audio.id))
+        except Exception as exc:
+            logger.exception("Could not queue censoring for audio %s", audio.id)
+            audio.status = AudioStatus.failed
+            self.session.add(audio)
+            await self.session.commit()
+            raise TaskQueueError(
+                "The audio was saved but could not be queued for processing."
+            ) from exc
         return audio

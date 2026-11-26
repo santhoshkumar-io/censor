@@ -6,7 +6,6 @@ import whisperx
 from better_profanity import profanity
 from pydub import AudioSegment
 from pydub.generators import Sine
-from rich import print_json
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pydub")
 
@@ -19,6 +18,9 @@ class Word(TypedDict):
 
 
 class AudioCensor:
+    """Transcribe, flag and beep out profanity. Plain class: the Celery task
+    (CensorTask in tasks.py) owns the task and DB session and creates this once."""
+
     def __init__(
         self,
         model_name: str = "small",
@@ -34,17 +36,23 @@ class AudioCensor:
         self.language = language
         self.batch_size = batch_size
 
-        # Load both models once, at construction, and reuse them for every call.
-        self.whisper_model = whisperx.load_model(
-            self.model_name,
-            self.device,
-            compute_type=self.compute_type,
-            language=self.language,
-        )
-        self.align_model, self.align_metadata = whisperx.load_align_model(
-            language_code=self.language, device=self.device
-        )
+        # Loaded lazily on the first transcription, then reused for every call.
+        self.whisper_model: Any = None
+        self.align_model: Any = None
+        self.align_metadata: Any = None
 
+    def _load_models(self) -> None:
+        if self.whisper_model is None:
+            self.whisper_model = whisperx.load_model(
+                self.model_name,
+                self.device,
+                compute_type=self.compute_type,
+                language=self.language,
+            )
+        if self.align_model is None or self.align_metadata is None:
+            self.align_model, self.align_metadata = whisperx.load_align_model(
+                language_code=self.language, device=self.device
+            )
 
     def transcribe_audio(self, audio_path: str) -> dict[str, Any]:
         """Transcribe an English audio file with WhisperX on CPU and align it.
@@ -54,6 +62,8 @@ class AudioCensor:
         ``score``. Words the aligner cannot place (e.g. bare numbers) may lack
         timestamps.
         """
+        self._load_models()
+
         audio = whisperx.load_audio(audio_path)
 
         result = self.whisper_model.transcribe(
